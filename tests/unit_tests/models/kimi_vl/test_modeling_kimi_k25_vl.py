@@ -14,6 +14,8 @@
 
 """Unit tests for Kimi K2.5 VL model, focusing on _merge_input_ids_with_image_features."""
 
+import sys
+import types
 from unittest.mock import Mock, patch
 
 import pytest
@@ -86,6 +88,75 @@ class TestKimiVisionAttentionConfig:
 
         assert vision_config._attn_implementation == "eager"
         assert DummyMoonViT._supports_flash_attn is False
+
+    @staticmethod
+    def _remote_module(**attention_functions):
+        module = types.ModuleType("dummy_kimi_remote_code")
+        module.VL_VISION_ATTENTION_FUNCTIONS = {
+            "flash_attention_2": object(),
+            "eager": object(),
+            **attention_functions,
+        }
+
+        class DummyMoonViT:
+            _supports_flash_attn_2 = True
+            _supports_sdpa = True
+
+        DummyMoonViT.__module__ = module.__name__
+        return module, DummyMoonViT
+
+    def test_falls_back_to_sdpa_registered_in_remote_attention_table(self):
+        from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import (
+            _configure_kimi_vision_attention,
+            _kimi_vision_sdpa,
+        )
+
+        module, DummyMoonViT = self._remote_module()
+        vision_config = Mock()
+        vision_config._attn_implementation = "flash_attention_2"
+
+        with (
+            patch.dict(sys.modules, {module.__name__: module}),
+            patch("megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl.is_flash_attn_2_available", return_value=False),
+        ):
+            _configure_kimi_vision_attention(vision_config, DummyMoonViT)
+
+        assert vision_config._attn_implementation == "sdpa"
+        assert module.VL_VISION_ATTENTION_FUNCTIONS["sdpa"] is _kimi_vision_sdpa
+
+    def test_keeps_sdpa_provided_by_remote_code(self):
+        from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import _configure_kimi_vision_attention
+
+        remote_sdpa = object()
+        module, DummyMoonViT = self._remote_module(sdpa=remote_sdpa)
+        vision_config = Mock()
+        vision_config._attn_implementation = "flash_attention_2"
+
+        with (
+            patch.dict(sys.modules, {module.__name__: module}),
+            patch("megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl.is_flash_attn_2_available", return_value=False),
+        ):
+            _configure_kimi_vision_attention(vision_config, DummyMoonViT)
+
+        assert vision_config._attn_implementation == "sdpa"
+        assert module.VL_VISION_ATTENTION_FUNCTIONS["sdpa"] is remote_sdpa
+
+    @pytest.mark.parametrize("lengths", [[6, 6, 6], [5, 9, 3]])
+    def test_kimi_vision_sdpa_attends_within_each_image(self, lengths):
+        from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import _kimi_vision_sdpa
+
+        num_heads, head_dim = 4, 8
+        q, k, v = (torch.randn(sum(lengths), num_heads, head_dim) for _ in range(3))
+        cu_seqlens = torch.tensor([0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32)
+
+        output = _kimi_vision_sdpa(q, k, v, q_cu_seqlens=cu_seqlens, k_cu_seqlens=cu_seqlens)
+
+        expected = []
+        for qi, ki, vi in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
+            qi, ki, vi = qi.transpose(0, 1), ki.transpose(0, 1), vi.transpose(0, 1)
+            weights = torch.softmax(qi @ ki.transpose(-2, -1) / head_dim**0.5, dim=-1)
+            expected.append((weights @ vi).transpose(0, 1).reshape(qi.shape[1], -1))
+        torch.testing.assert_close(output, torch.cat(expected))
 
 
 def _make_inputs(batch_size, seq_len, hidden_dim=HIDDEN_DIM):
