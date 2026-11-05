@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import logging
+import sys
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
+import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -90,13 +92,51 @@ def _split_attention_mask_on_cp_rank(
     raise ValueError(f"attention_mask must be 2D or 4D for CP slicing, got shape {tuple(attention_mask.shape)}.")
 
 
+def _kimi_vision_sdpa(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_cu_seqlens: Optional[Tensor] = None,
+    k_cu_seqlens: Optional[Tensor] = None,
+    **kwargs,
+) -> Tensor:
+    """Packed Kimi vision attention: SDPA over each image on its own.
+
+    ``q``, ``k`` and ``v`` are ``(total_len, num_heads, head_dim)``, and each sequence in ``q_cu_seqlens``
+    attends only to itself. Same signature as the attention functions in Kimi's remote MoonViT code.
+    """
+    total_len, num_heads, head_dim = q.shape
+    seqlens = [total_len] if q_cu_seqlens is None else (q_cu_seqlens[1:] - q_cu_seqlens[:-1]).tolist()
+    if len(set(seqlens)) == 1:
+        q, k, v = (x.reshape(len(seqlens), seqlens[0], num_heads, head_dim).transpose(1, 2) for x in (q, k, v))
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
+    else:
+        out = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    qi.transpose(0, 1).unsqueeze(0), ki.transpose(0, 1).unsqueeze(0), vi.transpose(0, 1).unsqueeze(0)
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                for qi, ki, vi in zip(q.split(seqlens), k.split(seqlens), v.split(seqlens))
+            ]
+        )
+    return out.reshape(total_len, -1)
+
+
 def _configure_kimi_vision_attention(vision_tower_config, vision_tower_cls) -> None:
-    """Use flash attention for Kimi vision when available.
+    """Use flash attention for Kimi vision when available, SDPA otherwise.
 
     Kimi's remote MoonViT code supports ``flash_attention_2`` through its own
     attention dispatch table, but older remote metadata only advertises
     ``_supports_flash_attn_2``. Transformers 5.6 checks ``_supports_flash_attn``
     before allowing the model to initialize with flash attention.
+
+    Without flash-attn, the remote table only offers ``eager``, which adds its
+    block-diagonal bool mask to the attention scores instead of masking them, so
+    images packed into one vision batch attend to each other. Register a
+    per-image SDPA in that table (unless the remote code already has one) and
+    use it instead.
     """
     if is_flash_attn_2_available():
         vision_tower_config._attn_implementation = "flash_attention_2"
@@ -104,9 +144,16 @@ def _configure_kimi_vision_attention(vision_tower_config, vision_tower_cls) -> N
             vision_tower_cls._supports_flash_attn = True
         return
 
-    if getattr(vision_tower_config, "_attn_implementation", None) == "flash_attention_2":
-        logger.warning("flash-attn is not available; falling back to eager attention for Kimi K2.5 vision tower.")
-        vision_tower_config._attn_implementation = "eager"
+    if getattr(vision_tower_config, "_attn_implementation", None) != "flash_attention_2":
+        return
+    attention_functions = getattr(sys.modules.get(vision_tower_cls.__module__), "VL_VISION_ATTENTION_FUNCTIONS", None)
+    if isinstance(attention_functions, dict) and getattr(vision_tower_cls, "_supports_sdpa", False):
+        attention_functions.setdefault("sdpa", _kimi_vision_sdpa)
+        logger.warning("flash-attn is not available; using SDPA for the Kimi K2.5 vision tower.")
+        vision_tower_config._attn_implementation = "sdpa"
+        return
+    logger.warning("flash-attn is not available; falling back to eager attention for Kimi K2.5 vision tower.")
+    vision_tower_config._attn_implementation = "eager"
 
 
 class KimiK25VLModel(MegatronModule):
